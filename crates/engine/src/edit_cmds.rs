@@ -107,6 +107,11 @@ fn lift(src: &Surface, sel: Option<&Surface>, canvas: Rect) -> Result<Clip> {
         let mk = m.format().channels().max(1);
         for (p, a) in px.chunks_exact_mut(n).zip(mask.chunks_exact(mk)) {
             p[n - 1] *= a[0];
+            // A fully cleared sample must not keep its colour: content bounds would still
+            // count it, and the layer would stay the size of the selection.
+            if p[n - 1] <= 0.0 {
+                p.fill(0.0);
+            }
         }
     }
     out.try_write_region(area, &px).map_err(|e| EngineError::Other(format!("not enough memory while copying pixels ({e}); the document was not changed")))?;
@@ -249,6 +254,142 @@ fn new_from_clipboard(s: &mut Session) -> Result<Value> {
     Ok(json!({"document": i, "width": w, "height": h}))
 }
 
+fn near(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (*x - *y).abs() <= 1.5 / 255.0)
+}
+
+/// One colour just outside `hole`, when that ring is flat. That is the canvas fill
+/// around a painted mark; a photo's ring is not flat and returns `None`.
+fn outside_colour(src: &Surface, hole: Rect) -> Option<Vec<f32>> {
+    let area = src.content_bounds();
+    let outer = hole.inflate(1).intersect(&area);
+    if outer.is_empty() {
+        return None;
+    }
+    let n = src.channels();
+    if n == 0 || n > 8 {
+        return None;
+    }
+    let mut colour: Option<Vec<f32>> = None;
+    let mut seen = 0u32;
+    let mut take = |x: i32, y: i32| -> bool {
+        if !area.contains(x, y) || hole.contains(x, y) {
+            return true;
+        }
+        let mut buf = [0.0f32; 8];
+        src.read_pixel(x, y, &mut buf[..n]);
+        seen += 1;
+        match &colour {
+            None => {
+                colour = Some(buf[..n].to_vec());
+                true
+            }
+            Some(c) => near(c, &buf[..n]),
+        }
+    };
+    for x in outer.x0..outer.x1 {
+        if !take(x, outer.y0) || !take(x, outer.y1 - 1) {
+            return None;
+        }
+    }
+    if outer.height() > 2 {
+        for y in outer.y0 + 1..outer.y1 - 1 {
+            if !take(outer.x0, y) || !take(outer.x1 - 1, y) {
+                return None;
+            }
+        }
+    }
+    (seen > 0).then_some(colour).flatten()
+}
+
+/// True when `surf` holds something other than `colour`. A solid fill does not.
+fn has_other(surf: &Surface, colour: &[f32]) -> bool {
+    let n = surf.channels();
+    if colour.len() != n {
+        return false;
+    }
+    let bounds = surf.content_bounds();
+    for c in bounds.tiles() {
+        let r = c.rect().intersect(&bounds);
+        if r.is_empty() {
+            continue;
+        }
+        let Ok(px) = surf.try_read_region(r) else { return false };
+        if px.chunks_exact(n).any(|p| !near(p, colour)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Make `colour` transparent. A layer that is only that colour is left as it is.
+fn blank_colour(surf: &mut Surface, colour: &[f32]) -> Result<()> {
+    let b = surf.content_bounds();
+    if b.is_empty() || colour.len() != surf.channels() {
+        return Ok(());
+    }
+    let n = colour.len();
+    let mut px = surf.try_read_region(b)?;
+    if !px.chunks_exact(n).any(|p| !near(p, colour)) {
+        return Ok(());
+    }
+    for p in px.chunks_exact_mut(n) {
+        if near(p, colour) {
+            p.fill(0.0);
+        }
+    }
+    surf.try_write_region(b, &px)?;
+    surf.prune();
+    Ok(())
+}
+
+/// Stop counting a flat fill as content without changing what a pixel read returns
+/// (a Background stays white). A layer that is only that fill is left alone.
+fn bury_colour(surf: &mut Surface, colour: &[f32]) -> Result<()> {
+    let n = surf.channels();
+    if colour.len() != n {
+        return Ok(());
+    }
+    let bounds = surf.content_bounds();
+    if bounds.is_empty() {
+        return Ok(());
+    }
+    let tiles: Vec<_> = bounds.tiles().collect();
+    let mut differs = false;
+    for c in &tiles {
+        let r = c.rect().intersect(&bounds);
+        if r.is_empty() {
+            continue;
+        }
+        let px = surf.try_read_region(r)?;
+        if px.chunks_exact(n).any(|p| !near(p, colour)) {
+            differs = true;
+            break;
+        }
+    }
+    if !differs {
+        return Ok(());
+    }
+    surf.set_default_pixel(colour);
+    for c in tiles {
+        let r = c.rect();
+        let mut px = surf.try_read_region(r)?;
+        let mut changed = false;
+        for p in px.chunks_exact_mut(n) {
+            let empty = p.last().is_some_and(|a| *a <= 1.5 / 255.0);
+            if empty || near(p, colour) {
+                p.copy_from_slice(colour);
+                changed = true;
+            }
+        }
+        if changed {
+            surf.try_write_region(r, &px)?;
+        }
+    }
+    surf.prune();
+    Ok(())
+}
+
 fn layer_via(s: &mut Session, cut: bool) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let id = active_id(s)?;
@@ -267,15 +408,37 @@ fn layer_via(s: &mut Session, cut: bool) -> Result<Value> {
         return Ok(json!({"layer": nid.0}));
     }
     let surf = d.doc.layer(id).and_then(Layer::surface).ok_or(EngineError::Other("the active layer has no pixels".into()))?;
-    let clip = lift(surf, d.doc.selection.as_ref(), d.doc.bounds())?;
+    let mut clip = lift(surf, d.doc.selection.as_ref(), d.doc.bounds())?;
     if clip.bounds.is_empty() {
         return Err(EngineError::Other("Could not complete the command: the selected area is empty".into()));
     }
     let bg = s.tools.background;
     let label = if cut { "Layer Via Cut" } else { "Layer Via Copy" };
     let nid = s.edit(label, |doc, active| {
+        // A marquee around a dab on a flat canvas (white Background, a filled layer) would
+        // otherwise keep that fill, so both layers stay the size of the marquee or the canvas.
+        let hole = doc.selection.as_ref().map(|m| m.content_bounds()).unwrap_or_else(|| doc.bounds());
+        let outside = doc.layer(id).and_then(Layer::surface).and_then(|surf| outside_colour(surf, hole));
+        // Decide before the cut. Clearing punches a hole, and that hole must not count as
+        // "other content" or a solid shape (a red rectangle) would be erased with the fill.
+        let varied = outside.as_deref().is_some_and(|colour| doc.layer(id).and_then(Layer::surface).is_some_and(|surf| has_other(surf, colour)));
         if cut {
             clear_selected(doc, id, bg)?;
+            if varied && let Some(colour) = outside.as_deref() {
+                let background = doc.layer(id).is_some_and(crate::extra_cmds::is_background);
+                if let Some(rest) = doc.layer_mut(id).and_then(|l| l.surface_mut()) {
+                    if background {
+                        // Keep reading as that fill (the canvas stays white) but stop counting
+                        // it as content, so the layer's bounds hug the remaining paint.
+                        bury_colour(rest, colour)?;
+                    } else {
+                        blank_colour(rest, colour)?;
+                    }
+                }
+            }
+            if let Some(colour) = outside.as_deref() {
+                blank_colour(&mut clip.surface, colour)?;
+            }
         }
         let mut l = Layer::raster(doc.next_layer_name("Layer"), clip.surface.format());
         *crate::pixels_mut(&mut l)? = clip.surface;
@@ -1022,12 +1185,53 @@ mod tests {
         assert_eq!(active_bounds(&s), Rect::new(10, 10, 20, 30));
         let d = &s.active().unwrap().doc;
         assert_eq!(d.layers[1].surface().unwrap().content_bounds(), Rect::new(20, 10, 50, 30));
+        // Two dots, a marquee larger than one of them: each layer hugs that dot.
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 100, "height": 80, "background": "transparent"})).unwrap();
+        s.edit("dots", |doc, a| {
+            let surf = doc.layer_mut(a.unwrap()).unwrap().surface_mut().unwrap();
+            surf.write_pixel(2, 3, &[1.0, 0.0, 0.0, 1.0]);
+            surf.write_pixel(90, 70, &[0.0, 0.0, 1.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap();
+        s.execute("layer.new.layerViaCut", json!({})).unwrap();
+        let d = &s.active().unwrap().doc;
+        let b = |i: usize| d.layers[i].surface().unwrap().content_bounds();
+        assert_eq!(b(0), Rect::new(90, 70, 91, 71), "source {:?}", b(0));
+        assert_eq!(b(1), Rect::new(2, 3, 3, 4), "cut {:?}", b(1));
         // Without a selection ⌘J duplicates the layer.
         let mut s = session();
         s.execute("layer.new.layerViaCopy", json!({})).unwrap();
         let d = &s.active().unwrap().doc;
         assert_eq!(d.layers.len(), 3);
         assert!(d.layers[2].name.ends_with("copy"));
+    }
+
+    /// Two marks on a white canvas: Layer via Cut leaves each layer the size of its mark.
+    /// The Background still reads as white; that fill is just no longer part of its bounds.
+    #[test]
+    fn layer_via_cut_crops_a_flat_canvas_down_to_each_mark() {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 100, "height": 80})).unwrap();
+        s.edit("dots", |doc, a| {
+            let surf = doc.layer_mut(a.unwrap()).unwrap().surface_mut().unwrap();
+            surf.write_pixel(2, 3, &[1.0, 0.0, 0.0, 1.0]);
+            surf.write_pixel(90, 70, &[0.0, 0.0, 1.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap();
+        s.execute("layer.new.layerViaCut", json!({})).unwrap();
+        let d = &s.active().unwrap().doc;
+        let (src, cut) = (d.layers[0].surface().unwrap(), d.layers[1].surface().unwrap());
+        assert_eq!(cut.content_bounds(), Rect::new(2, 3, 3, 4), "cut {:?}", cut.content_bounds());
+        assert_eq!(cut.pixel(2, 3), vec![1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(cut.pixel(8, 8)[3], 0.0, "white fill is not part of the cut layer");
+        assert_eq!(src.content_bounds(), Rect::new(90, 70, 91, 71), "source {:?}", src.content_bounds());
+        assert_eq!(src.pixel(90, 70), vec![0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(src.pixel(50, 40), vec![1.0, 1.0, 1.0, 1.0], "the canvas still reads as white");
     }
 
     /// #1096: Layer via Copy and Cut deselect, as Photoshop does, so a following Free Transform

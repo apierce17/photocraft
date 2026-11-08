@@ -169,6 +169,11 @@ impl Surface {
         decode_pixel(&self.format, &self.default_pixel)
     }
 
+    /// Untouched pixels read as `pixel`. Existing samples are left as they are.
+    pub fn set_default_pixel(&mut self, pixel: &[f32]) {
+        encode_pixel(&self.format, pixel, &mut self.default_pixel);
+    }
+
     /// Mutable access to a tile, allocating it (filled with the default pixel) or un-sharing it.
     pub fn tile_mut(&mut self, c: TileCoord) -> &mut Tile {
         let fmt = self.format;
